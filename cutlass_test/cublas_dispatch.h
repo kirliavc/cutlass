@@ -100,6 +100,7 @@ cublasStatus_t cublas_gemm_dispatch(
     cudaStream_t    stream = 0,                 ///< CUDA stream to launch kernels within.  Default is stream<sub>0</sub>.
     bool            debug_synchronous = false)  ///< Whether or not to synchronize the stream after every kernel launch to check for errors.
 {
+    /*
     return cublasHgemm(
         cublas_handle, transform_a, transform_b,
         m, n, k,
@@ -111,7 +112,27 @@ cublasStatus_t cublas_gemm_dispatch(
         &beta,
         d_c,
         m);
-
+    */
+    return cublasGemmEx(
+        cublas_handle,
+        transform_a,
+        transform_b,
+        m,
+        n,
+        k,
+        (void*) &alpha,
+        (void*) d_a,
+        CUDA_R_16F,
+        (transform_a == CUBLAS_OP_N) ? m : k,
+        (void*) d_b,
+        CUDA_R_16F,
+        (transform_b == CUBLAS_OP_N) ? k : n,
+        (void*) &beta,
+        (void*) d_c,
+        CUDA_R_16F,
+        m,
+        CUDA_R_16F,
+        CUBLAS_GEMM_DFALT_TENSOR_OP);
 }
 
 

@@ -61,6 +61,8 @@ struct tiling_strategy : printable_t
         Tall,
         Wide,
         Huge,
+        Test1,
+        WMMA_Wide
     };
 
     /// Enumerant value
@@ -87,6 +89,8 @@ struct tiling_strategy : printable_t
             case Tall:      return "tall";
             case Wide:      return "wide";
             case Huge:      return "huge";
+            case Test1:      return "test1";
+            case WMMA_Wide: return "WMMA_Wide";
             case Unknown:
             default:        return "unknown";
         }
@@ -427,10 +431,10 @@ template <
     matrix_transform_t::kind_t TransformB>      ///< Transformation op for matrix B
 struct gemm_policy<__half, __half, TransformA, TransformB, tiling_strategy::Huge> :
     block_task_policy<
-        128,    // _BlockItemsY
+        64,    // _BlockItemsY
         128,    // _BlockItemsX
         8,      // _BlockItemsK
-        16,     // _ThreadItemsY
+        8,     // _ThreadItemsY
         8,      // _ThreadItemsX
         false,  // _UseDoubleScratchTiles
         grid_raster_strategy::Default>   // _RasterStrategy
@@ -623,11 +627,11 @@ struct gemm_policy< half, float, TransformA, TransformB, tiling_strategy::Tall> 
 template <
     matrix_transform_t::kind_t TransformA,      ///< Transformation op for matrix A
     matrix_transform_t::kind_t TransformB>      ///< Transformation op for matrix B
-struct gemm_policy< half, float, TransformA, TransformB, tiling_strategy::Wide> :
+struct gemm_policy< half, half, TransformA, TransformB, tiling_strategy::WMMA_Wide> :
     gemm::block_task_wmma_policy<
         64,     // _BlockItemsY
         128,    // _BlockItemsX
-        64,     // _BlockItemsK
+        32,     // _BlockItemsK
         32,     // _WarpItemsY
         64,     // _WarpItemsX
         16,     // _WmmaItemsY
@@ -654,6 +658,22 @@ struct gemm_policy< half, float, TransformA, TransformB, tiling_strategy::Huge> 
         gemm::grid_raster_strategy::Default>    // _RasterStrategy
 {};
 
+template <
+    matrix_transform_t::kind_t TransformA,      ///< Transformation op for matrix A
+    matrix_transform_t::kind_t TransformB>      ///< Transformation op for matrix B
+struct gemm_policy< half, float, TransformA, TransformB, tiling_strategy::Test1> :
+    gemm::block_task_wmma_policy<
+        64,     // _BlockItemsY
+        128,    // _BlockItemsX
+        64,     // _BlockItemsK
+        32,     // _WarpItemsY
+        64,     // _WarpItemsX
+        16,     // _WmmaItemsY
+        16,     // _WmmaItemsX
+        16,     // _WmmaItemsK
+        false,  // _UseDoubleScratchTiles
+        gemm::grid_raster_strategy::Default>    // _RasterStrategy
+{};
 #endif
 
 

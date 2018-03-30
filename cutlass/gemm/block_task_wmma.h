@@ -44,7 +44,7 @@
 #include "block_loader.h"
 #include "block_loader_wmma.h"
 #include "wmma_accumulator.h"
-
+#include <mma.h>
 
 namespace cutlass {
 namespace gemm {
@@ -209,6 +209,15 @@ struct block_task_wmma
         /// True if the B matrix layout is row mayor (K is the strided dimension)
         IsLayoutCongruousB = (TransformB == matrix_transform_t::Transpose),
 
+        ThreadItemsX = 4,
+
+        ThreadItemsY = 2,
+
+        /// Number of WMMA blocks in warp row
+        WmmaBlocksX = divide_assert<WarpItemsX, WmmaItemsX>::value,
+
+        /// Number of WMMA blocks in a warp column
+        WmmaBlocksY = divide_assert<WarpItemsY, WmmaItemsY>::value,
     };
 
     /// WMMA may support unique types for A and B, so plan ahead for this
@@ -216,20 +225,6 @@ struct block_task_wmma
 
     /// WMMA may support unique types for A and B, so plan ahead for this
     typedef value_t value_b_t;
-
-    /// WMMA accumulator type
-    typedef wmma_accumulator<
-            WarpItemsY,
-            WarpItemsX,
-            WmmaItemsY,
-            WmmaItemsX,
-            WmmaItemsK,
-            value_a_t,
-            value_b_t,
-            accum_t,
-            TransformA,
-            TransformB>
-        accumulator_t;
 
     /// Thread block rasterization helper type
     typedef grid_raster<
@@ -262,19 +257,49 @@ struct block_task_wmma
             AllowRaggedTiles>
         block_loader_b_t;
 
-    /// Type alias for matrix A fragment type
-    typedef typename accumulator_t::fragment_a_t fragment_a_t;
 
-    /// Type alias for matrix B fragment type
-    typedef typename accumulator_t::fragment_b_t fragment_b_t;
+/// Fragment type for matrix operand A
+    typedef nvcuda::wmma::fragment<
+            nvcuda::wmma::matrix_a,
+            WmmaItemsY,
+            WmmaItemsX,
+            WmmaItemsK,
+            value_a_t,
+            typename matrix_layout<TransformA>::tag>
+        fragment_a_t;
+
+    /// Fragment type for matrix operand B
+    typedef nvcuda::wmma::fragment<
+            nvcuda::wmma::matrix_b,
+            WmmaItemsY,
+            WmmaItemsX,
+            WmmaItemsK,
+            value_b_t,
+            typename matrix_layout<TransformB>::tag>
+        fragment_b_t;
+
+    /// Fragment type for accumulator
+    typedef nvcuda::wmma::fragment<
+            nvcuda::wmma::accumulator,
+            WmmaItemsY,
+            WmmaItemsX,
+            WmmaItemsK,
+            accum_t>
+        accumulator_t;
+
+    typedef thread_accumulator<
+            ThreadItemsY,
+            ThreadItemsX,
+            value_t,
+            accum_t>
+        thread_accumulator_t;
+
+    /// Dot-product vector type along the K-axis (e.g, uchar4 when using IDP4A)
+    typedef typename thread_accumulator_t::dp_vector_t dp_vector_t;
 
     enum
     {
         /// Number of fragments from A matrix
-        WmmaBlocksY = accumulator_t::WmmaBlocksY,
-
-        /// Number of fragments from B matrix
-        WmmaBlocksX = accumulator_t::WmmaBlocksX,
 
         /// Number of value_t to pad the outer dimension of the shared A-tile
         PadItemsA = 16,
@@ -292,8 +317,33 @@ struct block_task_wmma
         LdmSmemB = (IsLayoutCongruousB? BlockItemsX : BlockItemsK)  + PadItemsB,
 
         StridedSmemB = (IsLayoutCongruousB ? BlockItemsK : BlockItemsX),
+
+        LdsVectorDpVectorsA = __NV_STD_MIN(
+            ThreadItemsY, 
+            __NV_STD_MAX(1, (128 / (__NV_STD_MAX(sizeof(dp_vector_t), sizeof(accum_t)) * 8)))),
+
+        /// Number of dp_vector_t along N-axis that can be read in a single LDS from the shared B-tile (up to 128b if more than one value_t)
+        LdsVectorDpVectorsB = __NV_STD_MIN(
+            ThreadItemsX, 
+            __NV_STD_MAX(1, (128 / (__NV_STD_MAX(sizeof(dp_vector_t), sizeof(accum_t)) * 8)))),
+
+
+        /// Number of strip-mined LDS vector reads from shared A-tile
+        ThreadLdsVectorsA = divide_assert<ThreadItemsY, LdsVectorDpVectorsA>::value,
+
+        /// Number of strip-mined LDS vector reads from shared B-tile
+        ThreadLdsVectorsB = divide_assert<ThreadItemsX, LdsVectorDpVectorsB>::value,
+
+        WarpThreadsX = 4,
+
+        WarpThreadsY = 8,
     };
 
+        /// Load-from-shared data movement type for A-tile, coarsened by LdsVectorDpVectorsA
+    typedef io_vector<dp_vector_t, LdsVectorDpVectorsA> lds_vector_a_t;
+
+    /// Load-from-shared data movement type for B-tile, coarsened by LdsVectorDpVectorsB
+    typedef io_vector<dp_vector_t, LdsVectorDpVectorsB> lds_vector_b_t;
     /// Shared memory layout for a prefetch page
     struct page_storage_t
     {
@@ -362,6 +412,7 @@ struct block_task_wmma
     /// Warp's coordinates (x, y) in thread block
     int2 block_warp_item_coords;
 
+    int2 warp_thread_coords;
     /// A tile loader
     block_loader_a_t loader_a;
 
@@ -375,8 +426,21 @@ struct block_task_wmma
     fragment_b_t local_slices_b[2][WmmaBlocksX];
 
     /// Accumulator tile
-    accumulator_t accumulator;
+    accumulator_t accumulators[7];
 
+    /// Thread's active-k/prefetch-k slices from shared A tile
+    lds_vector_a_t local_slices_as[2][ThreadLdsVectorsA];
+
+    /// Thread's active-k/prefetch-k slices from shared B tile
+    lds_vector_b_t local_slices_bs[2][ThreadLdsVectorsB];
+
+    /// Thread's base item offset within strip of A tile
+    int thread_strip_offset_a;
+
+    /// Thread's base item offset within strip of B tile
+    int thread_strip_offset_b;
+
+    thread_accumulator_t thread_accumulator;
 
     //-------------------------------------------------------------------------
     // Coordinate system helpers
@@ -391,6 +455,18 @@ struct block_task_wmma
         return make_int2(
             (warp_id / BlockWarpsY) * WarpItemsX,
             (warp_id % BlockWarpsY) * WarpItemsY);
+    }
+
+    // in fp16 calculation, the c slice data position
+    inline __device__
+    int2 thread_coords()
+    {
+        int lane_id = threadIdx.x % WarpThreads;
+
+        // Maxwell+ mapping of threads within a 2D warp for maximal LDS bandwidth
+        return make_int2(
+            lane_id / WarpThreadsY,
+            lane_id % WarpThreadsY);
     }
 
     /// Compute the thread block's base item-coordinates in matrix A
@@ -448,7 +524,7 @@ struct block_task_wmma
         block_item_coords_k(k_split.block_begin_item_k()),
         block_end_item_k(k_split.block_end_item_k(dim_k)),
         block_warp_item_coords(warp_item_coords()),
-
+        warp_thread_coords(thread_coords()),
         loader_a(
             reinterpret_cast<value_a_t const *>(d_a),
             (IsLayoutCongruousA ? dim_m : block_end_item_k),
@@ -465,14 +541,10 @@ struct block_task_wmma
             (IsLayoutCongruousB ? block_end_item_k : dim_n),
             (IsLayoutCongruousB ? dim_n : dim_k),
             (IsLayoutCongruousB ? block_item_coords_k : 0),
-            b_block_item_coords())
+            b_block_item_coords()),
+        thread_strip_offset_a(warp_thread_coords.y + (block_warp_item_coords.y * WarpItemsY)),
+        thread_strip_offset_b(warp_thread_coords.x + (block_warp_item_coords.x * WarpItemsX))
     {}
-
-
-    //-------------------------------------------------------------------------
-    // Prefetching utility methods
-    //-------------------------------------------------------------------------
-
     /**
      * Request the calling thread's slices of the shared tiles at depth \p tile_offset_k
      */
@@ -510,7 +582,95 @@ struct block_task_wmma
             nvcuda::wmma::load_matrix_sync(local_slices_a[i], smem_A_ptr, LdmSmemA);
         }
     }
+    /**
+     * Request the calling thread's slices of the shared tiles at depth \p tile_offset_k 
+     */
+    inline __device__ void request_local_prefetch_thread(
+        lds_vector_a_t (&slice_a)[ThreadLdsVectorsA],  ///< Slice from A
+        lds_vector_b_t (&slice_b)[ThreadLdsVectorsB],  ///< Slice from B
+        int tile_offset_k)
+    {
+        // Load B strip
+        /*
+        
+        #pragma unroll
+        for (int i = 0; i < ThreadLdsVectorsB; ++i)
+        {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j){
+                slice_b[i].buff[j]=scratch->pages[page_idx].alias().block_b[thread_strip_offset_b + (i * WarpThreadsX * LdsVectorDpVectorsB)][tile_offset_k];
+                
+            }
+        }
+        
+        
 
+        // Load A strip
+        
+
+        #pragma unroll
+        for (int i = 0; i < ThreadLdsVectorsA; ++i)
+        {
+            slice_a[i].load(&scratch->pages[page_idx].alias().block_a[tile_offset_k][thread_strip_offset_a + (i * WarpThreadsY * LdsVectorDpVectorsA)]);
+        }
+        */
+    }
+    inline __device__
+    void accumulator_init()
+    {
+        #pragma unroll
+        for (int x = 0; x < 7; ++x)
+        {
+            nvcuda::wmma::fill_fragment(accumulators[x], accum_t(0));
+        }
+
+    }
+    inline __device__
+    void thread_prefetch_calc(int i)
+    {
+        typedef dp_vector_t thread_tile_a_t[ThreadLdsVectorsA * LdsVectorDpVectorsA];
+        typedef dp_vector_t thread_tile_b_t[ThreadLdsVectorsB * LdsVectorDpVectorsB];
+
+        //request_local_prefetch_thread(local_slices_as[(i+1)%2],local_slices_bs[(i+1)%2],(i) % BlockItemsK);
+        thread_tile_a_t &thread_tile_a = reinterpret_cast<thread_tile_a_t&>(local_slices_as[i % 2]);
+        thread_tile_b_t &thread_tile_b = reinterpret_cast<thread_tile_b_t&>(local_slices_bs[i % 2]);
+        thread_accumulator.multiply_accumulate(thread_tile_a, thread_tile_b);
+    }
+    /**
+     * \brief Compute the product of tile_a and tile_b and add the result to
+     * the tile of accumulators.
+     */
+    inline __device__
+    void multiply_accumulate(
+        fragment_a_t (&tile_a)[WmmaBlocksY],
+        fragment_b_t (&tile_b)[WmmaBlocksX],
+        int tile_offset_k)
+    {
+        int i = 0;
+
+        thread_prefetch_calc(tile_offset_k+i);
+        thread_prefetch_calc(tile_offset_k+i+1);
+        #pragma unroll
+        for (int x = 0; x < WmmaBlocksX; ++x)
+        {
+            #pragma unroll
+            for (int y = 0; y < WmmaBlocksY; ++y)
+            {
+                if(x==WmmaBlocksX-1&&y==WmmaBlocksY-1)
+                    break;
+                i+=2;
+                nvcuda::wmma::mma_sync(accumulators[x*WmmaBlocksY+y], tile_a[y], tile_b[x], accumulators[x*WmmaBlocksY+y]);
+                
+                thread_prefetch_calc(tile_offset_k+i);
+                thread_prefetch_calc(tile_offset_k+i+1);
+            }
+        }
+    }
+    //-------------------------------------------------------------------------
+    // Prefetching utility methods
+    //-------------------------------------------------------------------------
+
+    
 
     //-------------------------------------------------------------------------
     // Epilogue
@@ -560,10 +720,12 @@ struct block_task_wmma
             #pragma unroll
             for (int yb = 0; yb < WmmaBlocksY; ++yb)
             {
+                if(xb==WmmaBlocksX-1&&yb==WmmaBlocksY-1)
+                    break;
                 // Store accumulator tile to SMEM
                 nvcuda::wmma::store_matrix_sync(
                     smem_scratch,
-                    accumulator.accumulators[xb][yb],
+                    accumulators[xb*WmmaBlocksY+yb],
                     SmemStride,
                     matrix_layout<matrix_transform_t::NonTranspose>::kind);
 
@@ -598,10 +760,10 @@ struct block_task_wmma
                         // NB: inline PTX to utilize strong operations for inter-block synchronization.
                         //     The following is equivalent to:
                         //
-                        //         c_element = c_ptr[0];
-                        asm volatile ("ld.global.cg.f32 %0, [%1];\n" : "=f"(c_element) : "l"(c_ptr));
+                                 c_element = c_ptr[0];
+                        //asm volatile ("ld.global.cg.f32 %0, [%1];\n" : "=f"(c_element) : "l"(c_ptr));
                     }
-
+                    
                     c_element = epilogue_op(accum, c_element, c_index);
 
                     if (pred)
@@ -609,9 +771,9 @@ struct block_task_wmma
                         // NB: inline PTX to utilize strong operations for inter-block synchronization.
                         //     The following is equivalent to:
                         //
-                        //         c_ptr[0] = c_element;
+                                 c_ptr[0] = c_element;
 
-                        asm volatile ("st.global.cg.f32 [%0], %1;\n" : : "l"(c_ptr), "f"(c_element));
+                        //asm volatile ("st.global.cg.f32 [%0], %1;\n" : : "l"(c_ptr), "f"(c_element));
                     }
 
                     // Increment output pointer
@@ -619,6 +781,20 @@ struct block_task_wmma
                     c_index += dim_m * ItemsX;
                 }
                 __syncthreads();
+            }
+        }
+        #pragma unroll
+        for(int xb=0;xb<ThreadItemsX;xb++){
+            #pragma unroll
+            for(int yb=0;yb<ThreadItemsY;yb++){
+                accum_t accum=thread_accumulator.get(xb,yb);
+                int c_x = (warp_base_x + 3 * WmmaItemsX + lane_read_x);
+                int c_y = (warp_base_y + 2 * WmmaItemsY + lane_read_y);
+                int c_index = (c_x+xb) * dim_m + c_y+yb;
+                accum_t *c_ptr = reinterpret_cast<accum_t *>(d_c) + (c_x+xb) * dim_m + c_y+yb;
+                accum_t c_element = c_ptr[0];
+                c_element = epilogue_op(accum, c_element, c_index);
+                c_ptr[0] = c_element;
             }
         }
 
@@ -680,16 +856,31 @@ struct block_task_wmma
             }
 
             // Accumulate this dp-stripe product
-            accumulator.multiply_accumulate(
+            multiply_accumulate(
                 local_slices_a[active_lds_idx],
-                local_slices_b[active_lds_idx]);
+                local_slices_b[active_lds_idx],
+                tile_offset_k);
 
             // Request local prefetch for next strip
             request_local_prefetch(
                 local_slices_a[next_lds_idx],
                 local_slices_b[next_lds_idx],
                 (tile_offset_k + WmmaItemsK) % BlockItemsK);
+            /*
+            #pragma unroll
+            for(int i=0;i<16;i++){
+                typedef dp_vector_t thread_tile_a_t[ThreadLdsVectorsA * LdsVectorDpVectorsA];
+                typedef dp_vector_t thread_tile_b_t[ThreadLdsVectorsB * LdsVectorDpVectorsB];
+
+                //request_local_prefetch_thread(local_slices_as[(i+1)%2],local_slices_bs[(i+1)%2],(i) % BlockItemsK);
+                thread_tile_a_t &thread_tile_a = reinterpret_cast<thread_tile_a_t&>(local_slices_as[i % 2]);
+                thread_tile_b_t &thread_tile_b = reinterpret_cast<thread_tile_b_t&>(local_slices_bs[i % 2]);
+                thread_accumulator.multiply_accumulate(thread_tile_a, thread_tile_b);
+            }
+            */
+                //thread_prefetch_calc(tile_offset_k+i);
         }
+            
     }
 
     //-------------------------------------------------------------------------
@@ -725,8 +916,7 @@ struct block_task_wmma
         __syncthreads();
 
         // Initialize thread's slice of accumulators
-        accumulator.init();
-
+        accumulator_init();
         // Request first iteration of local prefetch strips
         request_local_prefetch(
             local_slices_a[0],

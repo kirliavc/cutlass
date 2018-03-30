@@ -108,7 +108,7 @@ endif
 
 BASE_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
-NVCC := "$(shell which nvcc)"
+NVCC := /usr/local/cuda/bin/nvcc
 ifdef nvccver
     NVCC_VERSION := $(nvccver)
 else
@@ -119,7 +119,7 @@ endif
 OSUPPER := $(shell uname -s 2>/dev/null | tr [:lower:] [:upper:])
 
 # Default flags: verbose kernel properties (regs, smem, cmem, etc.); runtimes for compilation phases
-NVCCFLAGS += -O3 -Xptxas -v
+NVCCFLAGS += -O3 -Xptxas -v 
 CLANG_CFLAGS += -O3 -Xcuda-ptxas -v
 ifeq (WIN_NT, $(findstring WIN_NT, $(OSUPPER)))
     # For MSVC

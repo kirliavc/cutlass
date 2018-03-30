@@ -395,8 +395,7 @@ public:
 
     /// Constructor
     inline __device__
-    thread_accumulator(
-        scratch_storage_t &scratch)
+    thread_accumulator()
     {}
 
 

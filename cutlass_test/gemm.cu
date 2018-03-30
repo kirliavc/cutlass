@@ -371,6 +371,7 @@ bool test(
         accum_t>(m, n, k, accum_t(alpha), accum_t(beta));
 
     // CUTLASS
+    /*
     test_error |= test<
         cutlass_gemm_dispatch<gemm::tiling_strategy::Small, math_op, TransformA, TransformB, value_t, accum_t>,
         TransformA,
@@ -398,21 +399,21 @@ bool test(
         TransformB,
         value_t,
         accum_t>(m, n, k, accum_t(alpha), accum_t(beta));
-
+    */
     test_error |= test<
-        cutlass_gemm_dispatch<gemm::tiling_strategy::Wide, math_op, TransformA, TransformB, value_t, accum_t>,
+        cutlass_gemm_dispatch<gemm::tiling_strategy::WMMA_Wide, math_op, TransformA, TransformB, value_t, accum_t>,
         TransformA,
         TransformB,
         value_t,
         accum_t>(m, n, k, accum_t(alpha), accum_t(beta));
-
+    /*
     test_error |= test<
         cutlass_gemm_dispatch<gemm::tiling_strategy::Huge, math_op, TransformA, TransformB, value_t, accum_t>,
         TransformA,
         TransformB,
         value_t,
         accum_t>(m, n, k, accum_t(alpha), accum_t(beta));
-
+    */
     return test_error;
 }
 
@@ -432,7 +433,7 @@ int main(int argc, const char **argv)
     //
     // Problem type (compiler-supplied so we don't compile everything)
     //
-
+    cudaSetDevice(5);
     // Define value_t and accum_t (multiplicand and accumulator types, respectively)
 #if defined(TEST_SGEMM)
     typedef float       value_t;
@@ -452,7 +453,7 @@ int main(int argc, const char **argv)
     const math_operation_class_t math_op = math_operation_class_t::scalar;
 #elif defined(TEST_WGEMM)
     typedef half        value_t;
-    typedef float       accum_t;
+    typedef half       accum_t;
     const math_operation_class_t math_op = math_operation_class_t::matrix;
 #else
     #error Unknown GEMM type requested.
@@ -481,9 +482,9 @@ int main(int argc, const char **argv)
     command_line args(argc, argv);
 
     int m_factor    = args.device_prop.multiProcessorCount * 128;
-    int m           = round_nearest(4096, m_factor);
-    int k           = 4096;
-    int n           = 4096;
+    int m           = 10240;//round_nearest(4096, m_factor);
+    int k           = 10240;
+    int n           = 10240;
     float alpha     = 1.0;
     float beta      = 0.0;
 
